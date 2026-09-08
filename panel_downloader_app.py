@@ -15,12 +15,11 @@ Run with:
     streamlit run panel_downloader_app.py
 """
 
-import io
+import mimetypes
 import os
 import platform
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -38,11 +37,26 @@ st.set_page_config(page_title="Sales Panel Bulk Downloader", layout="centered")
 
 DEFAULT_DOWNLOAD_ROOT = Path.home() / "Downloads" / "SalesPanelAttachments"
 
+# Known file extensions - still the strongest signal when present.
 FILE_EXT_PATTERN = re.compile(
     r"\.(pdf|jpe?g|png|gif|webp|bmp|svg|docx?|xlsx?|pptx?|mp4|mov|zip)(\?|$)",
     re.IGNORECASE,
 )
 URL_IN_TEXT_PATTERN = re.compile(r'https?://[^\s"\'<>\\]+')
+
+# Fallback signal: many panels serve files through extension-less API
+# endpoints. If a link's path or query string contains one of these words,
+# treat it as a likely attachment even without a recognizable extension.
+ATTACHMENT_KEYWORD_PATTERN = re.compile(
+    r"(download|attachment|brochure|document|media|asset|file|cdn|export)",
+    re.IGNORECASE,
+)
+
+# JSON-ish "key": "https://..." pairs where the key name suggests a file link,
+# e.g. "fileUrl": "https://.../x", "docUrl": "...", "attachmentUrl": "..."
+JSON_URL_KEY_PATTERN = re.compile(
+    r'["\'](?:file|doc|attachment|brochure|image|img|media)?[uU]rl["\']\s*:\s*["\'](https?://[^"\']+)["\']'
+)
 
 BROWSER_COOKIE_LOADERS = {
     "Chrome": browser_cookie3.chrome,
@@ -56,7 +70,7 @@ BROWSER_COOKIE_LOADERS = {
 # Session / auth
 # ---------------------------------------------------------------------------
 
-def build_session(browser_name: str) -> requests.Session:
+def build_session(browser_name: str, panel_url: str) -> requests.Session:
     loader = BROWSER_COOKIE_LOADERS[browser_name]
     # No domain filter: browser-cookie3's domain filter does a substring match that
     # misses cookies stored against a parent domain (e.g. ".99acres.com" vs
@@ -68,7 +82,10 @@ def build_session(browser_name: str) -> requests.Session:
     session.headers.update(
         {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            # Several CDNs / attachment endpoints check Referer and will 403
+            # a bare request without it.
+            "Referer": panel_url,
         }
     )
     return session
@@ -80,9 +97,14 @@ def cookies_for_domain(session: requests.Session, domain: str):
     return [c for c in session.cookies if root in c.domain]
 
 
-def looks_logged_out(html: str) -> bool:
+def looks_logged_out(html: str, status_code: int, final_url: str) -> bool:
+    if status_code in (401, 403):
+        return True
     lowered = html.lower()
     signals = ["login", "log in", "sign in", "sso", "session expired", "unauthorized"]
+    url_lowered = final_url.lower()
+    if any(s.replace(" ", "") in url_lowered for s in ("login", "sso", "signin")):
+        return True
     # Weak heuristic: only flag if the page is short AND mentions a login-ish word,
     # since panel pages may legitimately contain the word "login" somewhere in a menu.
     return len(html) < 4000 and any(s in lowered for s in signals)
@@ -105,33 +127,58 @@ def guess_label(tag) -> str:
     return ""
 
 
+def _looks_like_attachment(url: str) -> bool:
+    if FILE_EXT_PATTERN.search(url):
+        return True
+    return bool(ATTACHMENT_KEYWORD_PATTERN.search(url))
+
+
 def extract_attachments(html: str, base_url: str):
     soup = BeautifulSoup(html, "html.parser")
     found = {}
 
+    def add(url, label):
+        if url not in found:
+            found[url] = {"url": url, "label": label}
+
+    # 1. Anchor tags - either a known extension, or a URL that otherwise
+    #    smells like a download/attachment endpoint.
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if FILE_EXT_PATTERN.search(href):
-            abs_url = urljoin(base_url, href)
-            found[abs_url] = {
-                "url": abs_url,
-                "label": guess_label(a) or a.get_text(strip=True) or "file",
-            }
+        abs_url = urljoin(base_url, href)
+        if _looks_like_attachment(abs_url):
+            add(abs_url, guess_label(a) or a.get_text(strip=True) or "file")
 
+    # 2. Images - always candidates.
     for img in soup.find_all("img", src=True):
-        src = img["src"]
-        abs_url = urljoin(base_url, src)
-        if abs_url not in found:
-            found[abs_url] = {"url": abs_url, "label": guess_label(img) or "image"}
+        abs_url = urljoin(base_url, img["src"])
+        add(abs_url, guess_label(img) or "image")
 
+    # 3. Any element carrying a data-* attribute that itself looks like a
+    #    file URL or path (common pattern for JS-driven download buttons).
+    for tag in soup.find_all(True):
+        for attr_name, attr_val in tag.attrs.items():
+            if not attr_name.startswith("data-") or not isinstance(attr_val, str):
+                continue
+            if attr_val.startswith("http") or attr_val.startswith("/"):
+                abs_url = urljoin(base_url, attr_val)
+                if _looks_like_attachment(abs_url):
+                    add(abs_url, guess_label(tag) or "file")
+
+    # 4. Script tags - scan full text (not just .string, which misses
+    #    anything but a single uninterrupted text node), for both bare URLs
+    #    and "xUrl": "..." JSON-style key/value pairs.
     for script in soup.find_all("script"):
-        text = script.string or ""
+        text = script.get_text() or ""
         if not text:
             continue
         for m in URL_IN_TEXT_PATTERN.finditer(text):
             url = m.group(0).rstrip('\\",)')
-            if FILE_EXT_PATTERN.search(url) and url not in found:
-                found[url] = {"url": url, "label": "file"}
+            if _looks_like_attachment(url):
+                add(url, "file")
+        for m in JSON_URL_KEY_PATTERN.finditer(text):
+            url = m.group(1).rstrip('\\",)')
+            add(urljoin(base_url, url), "file")
 
     return list(found.values())
 
@@ -150,6 +197,24 @@ def batch_id_from_url(url: str) -> str:
 # Download
 # ---------------------------------------------------------------------------
 
+def _extension_from_response(resp, fallback_url: str) -> str:
+    """Best-effort extension: Content-Disposition > Content-Type > URL path."""
+    cd = resp.headers.get("content-disposition", "")
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
+    if m:
+        name = m.group(1)
+        if "." in name:
+            return "." + name.rsplit(".", 1)[-1]
+
+    ext_match = re.search(r"\.(\w{2,5})(?:\?|$)", urlparse(fallback_url).path)
+    if ext_match:
+        return "." + ext_match.group(1)
+
+    content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+    guessed = mimetypes.guess_extension(content_type) if content_type else None
+    return guessed or ""
+
+
 def download_all(session: requests.Session, files, dest_folder: Path):
     dest_folder.mkdir(parents=True, exist_ok=True)
     results = []
@@ -159,14 +224,26 @@ def download_all(session: requests.Session, files, dest_folder: Path):
         try:
             resp = session.get(url, timeout=60)
             resp.raise_for_status()
-            original_name = sanitize_filename(urlparse(url).path.split("/")[-1] or f"{f['label']}_{i}")
-            dest_path = dest_folder / original_name
-            # avoid overwriting a different file that happens to share a name
+
+            content_type = resp.headers.get("content-type", "").lower()
+            if "text/html" in content_type and not url.lower().endswith((".html", ".htm")):
+                # We asked for a file and got an HTML page back - almost
+                # always means the session got logged out mid-run, or this
+                # particular link needs a different auth path.
+                raise ValueError("received an HTML page instead of a file (likely a login/redirect page)")
+
+            base_name = urlparse(url).path.split("/")[-1] or f["label"] or f"file_{i}"
+            base_name = sanitize_filename(base_name)
+            if "." not in base_name:
+                base_name += _extension_from_response(resp, url)
+
+            dest_path = dest_folder / base_name
             counter = 1
             while dest_path.exists():
-                stem, dot, ext = original_name.rpartition(".")
-                dest_path = dest_folder / (f"{stem}_{counter}.{ext}" if dot else f"{original_name}_{counter}")
+                stem, dot, ext = base_name.rpartition(".")
+                dest_path = dest_folder / (f"{stem}_{counter}.{ext}" if dot else f"{base_name}_{counter}")
                 counter += 1
+
             dest_path.write_bytes(resp.content)
             results.append((url, dest_path, None))
         except Exception as e:
@@ -214,7 +291,7 @@ if download_clicked:
 
     with st.spinner("Reading your login and fetching the panel..."):
         try:
-            session = build_session(browser_name)
+            session = build_session(browser_name, panel_url)
         except Exception as e:
             st.error(
                 f"Couldn't read cookies from {browser_name} ({e}). "
@@ -248,7 +325,7 @@ if download_clicked:
         )
         st.stop()
 
-    if looks_logged_out(html):
+    if looks_logged_out(html, resp.status_code, resp.url):
         st.error(
             "Cookies were found, but the fetched page still looks like a login screen. "
             "Check Diagnostics above — if the response is very short, the panel may render its content "
