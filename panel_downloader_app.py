@@ -36,6 +36,7 @@ st.set_page_config(page_title="Sales Panel Bulk Downloader", layout="centered")
 # ---------------------------------------------------------------------------
 
 DEFAULT_DOWNLOAD_ROOT = Path.home() / "Downloads" / "SalesPanelAttachments"
+PANEL_DOMAIN = "99acres.com"
 
 # Known file extensions - still the strongest signal when present.
 FILE_EXT_PATTERN = re.compile(
@@ -120,31 +121,26 @@ def locate_firefox_cookie_file():
 # Session / auth
 # ---------------------------------------------------------------------------
 
-def build_session(browser_name: str, panel_url: str, custom_cookie_path: str = "") -> requests.Session:
+def try_build_session(browser_name: str, panel_url: str, custom_cookie_path: str = "") -> tuple:
+    """Try to build a session and return (session, error_message). If successful, error_message is empty."""
     loader = BROWSER_COOKIE_LOADERS[browser_name]
-    # No domain filter: browser-cookie3's domain filter does a substring match that
-    # misses cookies stored against a parent domain (e.g. ".99acres.com" vs
-    # "www.99acres.com"). Loading everything is fast and 'requests' only ever
-    # sends the cookies that actually match the domain of each request anyway.
     explicit_path = custom_cookie_path.strip() or None
 
     try:
         cookiejar = loader(cookie_file=explicit_path) if explicit_path else loader()
     except Exception as primary_error:
         # Auto-fallback for Firefox: try known profile locations
-        # browser_cookie3 doesn't check (Microsoft Store install, snap, etc.)
         if browser_name == "Firefox" and not explicit_path:
             fallback_path = locate_firefox_cookie_file()
             if fallback_path:
-                cookiejar = loader(cookie_file=str(fallback_path))
+                try:
+                    cookiejar = loader(cookie_file=str(fallback_path))
+                except Exception as fallback_error:
+                    return None, f"Firefox cookie detection failed: {fallback_error}"
             else:
-                raise RuntimeError(
-                    f"{primary_error}. Auto-detection also failed - if you know where your "
-                    f"Firefox profile lives, paste the path to its cookies.sqlite file into "
-                    f"'Custom cookie file path' in the sidebar."
-                ) from primary_error
+                return None, f"{primary_error}. Auto-detection also failed."
         else:
-            raise
+            return None, str(primary_error)
 
     session = requests.Session()
     session.cookies.update(cookiejar)
@@ -152,12 +148,28 @@ def build_session(browser_name: str, panel_url: str, custom_cookie_path: str = "
         {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            # Several CDNs / attachment endpoints check Referer and will 403
-            # a bare request without it.
             "Referer": panel_url,
         }
     )
-    return session
+    return session, ""
+
+
+def auto_detect_browser_with_cookies(panel_domain: str) -> str:
+    """Try each browser in order and return the first one that has cookies for the panel domain."""
+    for browser_name in BROWSER_COOKIE_LOADERS.keys():
+        try:
+            session, error = try_build_session(browser_name, f"https://{panel_domain}", "")
+            if session is None:
+                continue
+            
+            # Check if session has cookies for the panel domain
+            matched_cookies = cookies_for_domain(session, panel_domain)
+            if matched_cookies:
+                return browser_name
+        except Exception:
+            continue
+    
+    return None
 
 
 def cookies_for_domain(session: requests.Session, domain: str):
@@ -342,21 +354,54 @@ def open_folder(path: Path):
 st.title("📦 Sales Panel Bulk Downloader")
 st.caption("Paste the panel link. Files are saved straight to a folder on your laptop.")
 
+# Initialize session state
+if "auto_detected_browser" not in st.session_state:
+    st.session_state.auto_detected_browser = None
+if "last_dest_root" not in st.session_state:
+    st.session_state.last_dest_root = str(DEFAULT_DOWNLOAD_ROOT)
+
 with st.sidebar:
-    st.header("Settings")
-    browser_name = st.selectbox("Browser you're logged into the panel with", list(BROWSER_COOKIE_LOADERS.keys()))
+    st.header("⚙️ Settings")
+    
+    # Auto-detect browser with 99acres cookies
+    if st.session_state.auto_detected_browser is None:
+        st.info("🔍 Auto-detecting browser with 99acres login...")
+        auto_detected = auto_detect_browser_with_cookies(PANEL_DOMAIN)
+        st.session_state.auto_detected_browser = auto_detected or False  # False means tried and failed
+    
+    if st.session_state.auto_detected_browser:
+        st.success(f"✅ Found active login in **{st.session_state.auto_detected_browser}**")
+        browser_name = st.session_state.auto_detected_browser
+        st.caption("Auto-detected - change below if needed")
+        browser_name = st.selectbox(
+            "Browser",
+            list(BROWSER_COOKIE_LOADERS.keys()),
+            index=list(BROWSER_COOKIE_LOADERS.keys()).index(browser_name),
+        )
+    else:
+        st.warning("⚠️ No active 99acres login found in any browser")
+        st.info("**How to fix:**")
+        st.write("1. Open Chrome, Firefox, Edge, or Brave")
+        st.write("2. Visit https://www.99acres.com")
+        st.write("3. Log in with your credentials")
+        st.write("4. Return here and try again")
+        browser_name = st.selectbox(
+            "Select browser manually",
+            list(BROWSER_COOKIE_LOADERS.keys()),
+        )
+    
     custom_cookie_path = st.text_input(
         "Custom cookie file path (optional)",
         value="",
-        help=(
-            "Only needed if auto-detection fails (e.g. Firefox installed via the Microsoft "
-            "Store). Point this at the browser's cookies file - for Firefox that's "
-            "cookies.sqlite inside your profile folder, e.g. "
-            "%APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite"
-        ),
+        help="Only needed if auto-detection fails. For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite",
     )
-    dest_root = st.text_input("Save downloads to", value=str(DEFAULT_DOWNLOAD_ROOT))
-    st.caption("A subfolder is created per batch automatically.")
+    
+    dest_root = st.text_input(
+        "Save downloads to",
+        value=st.session_state.last_dest_root,
+        help="Files will be organized in subfolders by batch.",
+    )
+    st.session_state.last_dest_root = dest_root
 
 panel_url = st.text_input(
     "Sales panel link",
@@ -370,13 +415,17 @@ if download_clicked:
 
     with st.spinner("Reading your login and fetching the panel..."):
         try:
-            session = build_session(browser_name, panel_url, custom_cookie_path)
+            session, error = try_build_session(browser_name, panel_url, custom_cookie_path)
+            if session is None:
+                raise RuntimeError(error)
         except Exception as e:
             st.error(
-                f"Couldn't read cookies from {browser_name} ({e}). "
-                f"Make sure {browser_name} is installed and you've logged into the panel there at least once. "
-                f"If auto-detection keeps failing, try the 'Custom cookie file path' field in the sidebar, "
-                f"or switch to Chrome/Edge/Brave if you're logged into the panel there too."
+                f"❌ **Couldn't read cookies from {browser_name}**: {e}\n\n"
+                f"**Try this:**\n"
+                f"1. Make sure {browser_name} is installed\n"
+                f"2. Visit https://www.99acres.com in {browser_name}\n"
+                f"3. Log in or confirm you're logged in\n"
+                f"4. Return here and click Download again"
             )
             st.stop()
 
@@ -386,48 +435,48 @@ if download_clicked:
             resp = session.get(panel_url, timeout=30, allow_redirects=True)
             html = resp.text
         except Exception as e:
-            st.error(f"Couldn't fetch the panel page: {e}")
+            st.error(f"❌ Couldn't fetch the panel page: {e}")
             st.stop()
 
-    with st.expander("Diagnostics (open this if you get a login error)"):
-        st.write(f"Cookies found for `{domain}`: **{len(matched_cookies)}**")
+    with st.expander("🔧 Diagnostics (if you get an error)"):
+        st.write(f"**Cookies found for `{domain}`:** {len(matched_cookies)}")
         if matched_cookies:
             st.caption(", ".join(c.name for c in matched_cookies))
-        st.write(f"HTTP status: **{resp.status_code}**")
-        st.write(f"Final URL after redirects: `{resp.url}`")
-        st.write(f"Response length: **{len(html)}** characters")
+        st.write(f"**HTTP status:** {resp.status_code}")
+        st.write(f"**Final URL:** `{resp.url}`")
+        st.write(f"**Response length:** {len(html)} characters")
         st.code(html[:1500])
 
     if not matched_cookies:
         st.error(
-            f"No cookies found for {domain} in {browser_name}. Either you're not logged in there, "
-            f"or {browser_name} couldn't be read (see Diagnostics above for what was found). "
-            f"Open {browser_name}, confirm the panel loads without asking you to log in, then retry."
+            f"❌ **No login cookies found for {domain}**\n\n"
+            f"**Fix:** Make sure you're logged into https://www.99acres.com in {browser_name}, "
+            f"then try downloading again."
         )
         st.stop()
 
     if looks_logged_out(html, resp.status_code, resp.url):
         st.error(
-            "Cookies were found, but the fetched page still looks like a login screen. "
-            "Check Diagnostics above — if the response is very short, the panel may render its content "
-            "with JavaScript after page load, which a plain request can't see. If so, let me know and "
-            "we'll need a different approach (e.g. finding the underlying data API)."
+            "⚠️ **Cookies found, but page looks like a login screen**\n\n"
+            "**Possible causes:**\n"
+            "- Session expired (log in again in your browser and retry)\n"
+            "- Page uses JavaScript to render (check Diagnostics)"
         )
         st.stop()
 
     attachments = extract_attachments(html, panel_url)
 
-    with st.expander("Debug: raw HTML fetched (first 3000 chars)"):
+    with st.expander("🔍 Debug: Raw HTML (first 3000 chars)"):
         st.code(html[:3000])
 
     if not attachments:
         st.warning(
-            "No attachments detected. Open the debug section above, search for the file type you "
-            "expect (e.g. .pdf), and share that snippet so detection can be tuned to this panel."
+            "❌ **No attachments detected on this page**\n\n"
+            "Check the Debug section above and look for file URLs you expect to see."
         )
         st.stop()
 
-    st.success(f"Found {len(attachments)} attachment(s). Downloading...")
+    st.success(f"✅ Found {len(attachments)} attachment(s). Downloading...")
 
     batch_id = batch_id_from_url(panel_url)
     dest_folder = Path(dest_root) / sanitize_filename(batch_id)
@@ -439,12 +488,15 @@ if download_clicked:
     ok = [r for r in results if r[1] is not None]
     failed = [r for r in results if r[1] is None]
 
-    st.success(f"✅ Downloaded {len(ok)}/{len(results)} file(s) in {elapsed:.1f}s to:\n\n`{dest_folder}`")
+    st.success(f"✅ Downloaded **{len(ok)}/{len(results)}** file(s) in **{elapsed:.1f}s**")
+    st.code(str(dest_folder), language="plaintext")
 
     if failed:
-        st.warning(f"{len(failed)} file(s) failed:")
+        st.warning(f"⚠️ {len(failed)} file(s) failed:")
         for url, _, err in failed:
-            st.caption(f"- {url} — {err}")
+            st.caption(f"- {url}\n  - {err}")
 
-    if st.button("📂 Open folder"):
-        open_folder(dest_folder)
+    # Auto-open folder
+    st.info("📂 Opening folder...")
+    open_folder(dest_folder)
+    st.success("✅ Folder opened! Check your file explorer.")
