@@ -64,6 +64,7 @@ BROWSER_COOKIE_LOADERS = {
     "Firefox": browser_cookie3.firefox,
     "Edge": browser_cookie3.edge,
     "Brave": browser_cookie3.brave,
+    "Comet": browser_cookie3.comet,
 }
 
 
@@ -381,7 +382,7 @@ with st.sidebar:
     else:
         st.warning("⚠️ No active 99acres login found in any browser")
         st.info("**How to fix:**")
-        st.write("1. Open Chrome, Firefox, Edge, or Brave")
+        st.write("1. Open Chrome, Firefox, Edge, Brave, or Comet")
         st.write("2. Visit https://www.99acres.com")
         st.write("3. Log in with your credentials")
         st.write("4. Return here and try again")
