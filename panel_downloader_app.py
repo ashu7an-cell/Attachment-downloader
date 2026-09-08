@@ -4,11 +4,9 @@ Sales Panel Bulk Downloader
 Paste a sales panel link, click Download, and every attachment (brochure,
 images, etc.) is saved straight into a folder on your laptop.
 
-No Selenium, no browser automation, no manual cookie copying. The app
-reads your existing login session directly from your browser's local
-cookie storage (the same way the browser itself would) and uses that to
-fetch and download - so it only works if you're already logged into the
-panel in that browser.
+This app can work in two ways:
+1. Local mode: Reads cookies directly from your browser (Chrome, Firefox, Edge, Brave)
+2. Cloud mode: You provide your cookies manually via a cookie file
 
 Run with:
     pip install -r requirements.txt
@@ -152,6 +150,41 @@ def try_build_session(browser_name: str, panel_url: str, custom_cookie_path: str
         }
     )
     return session, ""
+
+
+def build_session_from_cookies_file(cookies_file) -> tuple:
+    """Build session from uploaded cookies.sqlite file (Firefox/Chrome format)."""
+    try:
+        import sqlite3
+        
+        # Save uploaded file temporarily
+        temp_path = Path("/tmp/cookies_temp.sqlite")
+        temp_path.write_bytes(cookies_file.read())
+        
+        # Load cookies using browser_cookie3 with the temp file
+        # Try Firefox first, then Chrome format
+        try:
+            cookiejar = browser_cookie3.firefox(cookie_file=str(temp_path))
+        except:
+            try:
+                cookiejar = browser_cookie3.chrome(cookie_file=str(temp_path))
+            except Exception as e:
+                return None, f"Could not read cookies file: {e}"
+        
+        session = requests.Session()
+        session.cookies.update(cookiejar)
+        session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            }
+        )
+        
+        # Clean up
+        temp_path.unlink(missing_ok=True)
+        return session, ""
+    except Exception as e:
+        return None, f"Error reading cookies file: {e}"
 
 
 def auto_detect_browser_with_cookies(panel_domain: str) -> str:
@@ -363,37 +396,62 @@ if "last_dest_root" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # Auto-detect browser with 99acres cookies
-    if st.session_state.auto_detected_browser is None:
-        st.info("🔍 Auto-detecting browser with 99acres login...")
-        auto_detected = auto_detect_browser_with_cookies(PANEL_DOMAIN)
-        st.session_state.auto_detected_browser = auto_detected or False  # False means tried and failed
+    # Check if running in cloud/remote environment
+    is_remote = "/mount/src/" in os.getcwd() or "streamlit" in os.getcwd()
     
-    if st.session_state.auto_detected_browser:
-        st.success(f"✅ Found active login in **{st.session_state.auto_detected_browser}**")
-        browser_name = st.session_state.auto_detected_browser
-        st.caption("Auto-detected - change below if needed")
-        browser_name = st.selectbox(
-            "Browser",
-            list(BROWSER_COOKIE_LOADERS.keys()),
-            index=list(BROWSER_COOKIE_LOADERS.keys()).index(browser_name),
+    if is_remote:
+        st.info("🌐 **Cloud Mode** - Upload your cookies file")
+        st.write("Since this is running on a server, you need to provide cookies manually:")
+        
+        # Option 1: Upload cookies.sqlite file
+        uploaded_cookies = st.file_uploader(
+            "📁 Upload cookies.sqlite from your browser",
+            type=["sqlite", "db"],
+            help="For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\[profile]\\cookies.sqlite\nFor Chrome: %APPDATA%\\..\\Local\\Google\\Chrome\\User Data\\Default\\Cookies"
         )
+        
+        if uploaded_cookies:
+            session_obj = None
+            error_msg = ""
+        else:
+            session_obj = None
+            error_msg = "Please upload your cookies.sqlite file"
     else:
-        st.warning("⚠️ No active 99acres login found in any browser")
-        st.info("**How to fix:**")
-        st.write("1. Open Chrome, Firefox, Edge, or Brave")
-        st.write("2. Visit https://www.99acres.com")
-        st.write("3. Log in with your credentials")
-        st.write("4. Return here and try again")
-        browser_name = st.selectbox(
-            "Select browser manually",
-            list(BROWSER_COOKIE_LOADERS.keys()),
-        )
+        st.info("💻 **Local Mode** - Using your browser cookies")
+        
+        # Auto-detect browser with 99acres cookies
+        if st.session_state.auto_detected_browser is None:
+            st.info("🔍 Auto-detecting browser with 99acres login...")
+            auto_detected = auto_detect_browser_with_cookies(PANEL_DOMAIN)
+            st.session_state.auto_detected_browser = auto_detected or False  # False means tried and failed
+        
+        if st.session_state.auto_detected_browser:
+            st.success(f"✅ Found active login in **{st.session_state.auto_detected_browser}**")
+            browser_name = st.session_state.auto_detected_browser
+            st.caption("Auto-detected - change below if needed")
+            browser_name = st.selectbox(
+                "Browser",
+                list(BROWSER_COOKIE_LOADERS.keys()),
+                index=list(BROWSER_COOKIE_LOADERS.keys()).index(browser_name),
+            )
+        else:
+            st.warning("⚠️ No active 99acres login found in any browser")
+            st.info("**How to fix:**")
+            st.write("1. Open Chrome, Firefox, Edge, or Brave")
+            st.write("2. Visit https://www.99acres.com")
+            st.write("3. Log in with your credentials")
+            st.write("4. Return here and try again")
+            browser_name = st.selectbox(
+                "Select browser manually",
+                list(BROWSER_COOKIE_LOADERS.keys()),
+            )
+        
+        uploaded_cookies = None
     
     custom_cookie_path = st.text_input(
         "Custom cookie file path (optional)",
         value="",
-        help="Only needed if auto-detection fails. For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite",
+        help="For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite",
     )
     
     dest_root = st.text_input(
@@ -412,20 +470,27 @@ download_clicked = st.button("⬇️ Download all attachments", type="primary", 
 
 if download_clicked:
     domain = urlparse(panel_url).netloc
+    is_remote = "/mount/src/" in os.getcwd() or "streamlit" in os.getcwd()
 
     with st.spinner("Reading your login and fetching the panel..."):
         try:
-            session, error = try_build_session(browser_name, panel_url, custom_cookie_path)
-            if session is None:
-                raise RuntimeError(error)
+            if is_remote and uploaded_cookies:
+                # Cloud mode: use uploaded cookies file
+                session, error = build_session_from_cookies_file(uploaded_cookies)
+                if session is None:
+                    raise RuntimeError(error)
+            else:
+                # Local mode: use browser cookies
+                session, error = try_build_session(browser_name, panel_url, custom_cookie_path)
+                if session is None:
+                    raise RuntimeError(error)
         except Exception as e:
             st.error(
-                f"❌ **Couldn't read cookies from {browser_name}**: {e}\n\n"
+                f"❌ **Couldn't read cookies**: {e}\n\n"
                 f"**Try this:**\n"
-                f"1. Make sure {browser_name} is installed\n"
-                f"2. Visit https://www.99acres.com in {browser_name}\n"
-                f"3. Log in or confirm you're logged in\n"
-                f"4. Return here and click Download again"
+                f"1. Make sure your cookies file is valid\n"
+                f"2. Visit https://www.99acres.com and log in\n"
+                f"3. Upload your cookies.sqlite file"
             )
             st.stop()
 
@@ -450,8 +515,7 @@ if download_clicked:
     if not matched_cookies:
         st.error(
             f"❌ **No login cookies found for {domain}**\n\n"
-            f"**Fix:** Make sure you're logged into https://www.99acres.com in {browser_name}, "
-            f"then try downloading again."
+            f"**Fix:** Make sure your cookies.sqlite file contains 99acres.com login cookies"
         )
         st.stop()
 
@@ -459,7 +523,7 @@ if download_clicked:
         st.error(
             "⚠️ **Cookies found, but page looks like a login screen**\n\n"
             "**Possible causes:**\n"
-            "- Session expired (log in again in your browser and retry)\n"
+            "- Session expired (log in again in your browser)\n"
             "- Page uses JavaScript to render (check Diagnostics)"
         )
         st.stop()
