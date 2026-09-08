@@ -56,9 +56,13 @@ BROWSER_COOKIE_LOADERS = {
 # Session / auth
 # ---------------------------------------------------------------------------
 
-def build_session(browser_name: str, domain: str) -> requests.Session:
+def build_session(browser_name: str) -> requests.Session:
     loader = BROWSER_COOKIE_LOADERS[browser_name]
-    cookiejar = loader(domain_name=domain)  # reads cookies straight from local browser storage
+    # No domain filter: browser-cookie3's domain filter does a substring match that
+    # misses cookies stored against a parent domain (e.g. ".99acres.com" vs
+    # "www.99acres.com"). Loading everything is fast and 'requests' only ever
+    # sends the cookies that actually match the domain of each request anyway.
+    cookiejar = loader()
     session = requests.Session()
     session.cookies.update(cookiejar)
     session.headers.update(
@@ -68,6 +72,12 @@ def build_session(browser_name: str, domain: str) -> requests.Session:
         }
     )
     return session
+
+
+def cookies_for_domain(session: requests.Session, domain: str):
+    """Cookies in the jar whose domain matches (loosely) the target site - for diagnostics only."""
+    root = ".".join(domain.split(".")[-2:]) if domain.count(".") >= 1 else domain
+    return [c for c in session.cookies if root in c.domain]
 
 
 def looks_logged_out(html: str) -> bool:
@@ -204,7 +214,7 @@ if download_clicked:
 
     with st.spinner("Reading your login and fetching the panel..."):
         try:
-            session = build_session(browser_name, domain)
+            session = build_session(browser_name)
         except Exception as e:
             st.error(
                 f"Couldn't read cookies from {browser_name} ({e}). "
@@ -212,18 +222,38 @@ if download_clicked:
             )
             st.stop()
 
+        matched_cookies = cookies_for_domain(session, domain)
+
         try:
-            resp = session.get(panel_url, timeout=30)
-            resp.raise_for_status()
+            resp = session.get(panel_url, timeout=30, allow_redirects=True)
             html = resp.text
         except Exception as e:
             st.error(f"Couldn't fetch the panel page: {e}")
             st.stop()
 
-    if not session.cookies or looks_logged_out(html):
+    with st.expander("Diagnostics (open this if you get a login error)"):
+        st.write(f"Cookies found for `{domain}`: **{len(matched_cookies)}**")
+        if matched_cookies:
+            st.caption(", ".join(c.name for c in matched_cookies))
+        st.write(f"HTTP status: **{resp.status_code}**")
+        st.write(f"Final URL after redirects: `{resp.url}`")
+        st.write(f"Response length: **{len(html)}** characters")
+        st.code(html[:1500])
+
+    if not matched_cookies:
         st.error(
-            f"You don't look logged into the panel in {browser_name} right now. "
-            f"Please open {browser_name}, log into the panel normally, then click Download again."
+            f"No cookies found for {domain} in {browser_name}. Either you're not logged in there, "
+            f"or {browser_name} couldn't be read (see Diagnostics above for what was found). "
+            f"Open {browser_name}, confirm the panel loads without asking you to log in, then retry."
+        )
+        st.stop()
+
+    if looks_logged_out(html):
+        st.error(
+            "Cookies were found, but the fetched page still looks like a login screen. "
+            "Check Diagnostics above — if the response is very short, the panel may render its content "
+            "with JavaScript after page load, which a plain request can't see. If so, let me know and "
+            "we'll need a different approach (e.g. finding the underlying data API)."
         )
         st.stop()
 
