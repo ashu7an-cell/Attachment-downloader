@@ -67,16 +67,85 @@ BROWSER_COOKIE_LOADERS = {
 
 
 # ---------------------------------------------------------------------------
+# Profile auto-detection (fallback for when browser_cookie3 can't find it)
+# ---------------------------------------------------------------------------
+
+def _candidate_firefox_roots():
+    """Known Firefox profile-root locations across OS + install methods.
+
+    browser_cookie3 only checks the "normal" install location. It misses
+    Firefox installed via the Microsoft Store on Windows (profiles live under
+    a sandboxed Packages\\ folder) and Linux snap/flatpak installs.
+    """
+    system = platform.system()
+    home = Path.home()
+    candidates = []
+
+    if system == "Windows":
+        appdata = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming")))
+        candidates.append(appdata / "Mozilla" / "Firefox" / "Profiles")
+
+        localappdata = Path(os.environ.get("LOCALAPPDATA", str(home / "AppData" / "Local")))
+        packages_dir = localappdata / "Packages"
+        if packages_dir.exists():
+            for pkg in packages_dir.glob("Mozilla.Firefox_*"):
+                candidates.append(pkg / "LocalCache" / "Roaming" / "Mozilla" / "Firefox" / "Profiles")
+
+    elif system == "Darwin":
+        candidates.append(home / "Library" / "Application Support" / "Firefox" / "Profiles")
+
+    else:  # Linux and friends
+        candidates.append(home / ".mozilla" / "firefox")
+        candidates.append(home / "snap" / "firefox" / "common" / ".mozilla" / "firefox")
+        candidates.append(home / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox")
+
+    return candidates
+
+
+def locate_firefox_cookie_file():
+    """Search known profile roots for cookies.sqlite, preferring default-release."""
+    best = None
+    for root in _candidate_firefox_roots():
+        if not root.exists():
+            continue
+        matches = list(root.glob("*/cookies.sqlite"))
+        for path in matches:
+            rank = 0 if "default-release" in path.parent.name else 1 if "default" in path.parent.name else 2
+            if best is None or rank < best[0]:
+                best = (rank, path)
+    return best[1] if best else None
+
+
+# ---------------------------------------------------------------------------
 # Session / auth
 # ---------------------------------------------------------------------------
 
-def build_session(browser_name: str, panel_url: str) -> requests.Session:
+def build_session(browser_name: str, panel_url: str, custom_cookie_path: str = "") -> requests.Session:
     loader = BROWSER_COOKIE_LOADERS[browser_name]
     # No domain filter: browser-cookie3's domain filter does a substring match that
     # misses cookies stored against a parent domain (e.g. ".99acres.com" vs
     # "www.99acres.com"). Loading everything is fast and 'requests' only ever
     # sends the cookies that actually match the domain of each request anyway.
-    cookiejar = loader()
+    explicit_path = custom_cookie_path.strip() or None
+
+    try:
+        cookiejar = loader(cookie_file=explicit_path) if explicit_path else loader()
+    except Exception as primary_error:
+        # Auto-fallback for Firefox: try known profile locations
+        # browser_cookie3 doesn't check (Microsoft Store install, snap, etc.)
+        if browser_name == "Firefox" and not explicit_path:
+            fallback_path = locate_firefox_cookie_file()
+            if fallback_path:
+                cookiejar = loader(cookie_file=str(fallback_path))
+            else:
+                raise RuntimeError(
+                    f"{primary_error}. Auto-detection also failed - if you know where your "
+                    f"Firefox profile lives, paste the path to its cookies.sqlite file into "
+                    f"'Custom cookie file path' in the sidebar."
+                ) from primary_error
+        else:
+            raise
+
     session = requests.Session()
     session.cookies.update(cookiejar)
     session.headers.update(
@@ -276,6 +345,16 @@ st.caption("Paste the panel link. Files are saved straight to a folder on your l
 with st.sidebar:
     st.header("Settings")
     browser_name = st.selectbox("Browser you're logged into the panel with", list(BROWSER_COOKIE_LOADERS.keys()))
+    custom_cookie_path = st.text_input(
+        "Custom cookie file path (optional)",
+        value="",
+        help=(
+            "Only needed if auto-detection fails (e.g. Firefox installed via the Microsoft "
+            "Store). Point this at the browser's cookies file - for Firefox that's "
+            "cookies.sqlite inside your profile folder, e.g. "
+            "%APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite"
+        ),
+    )
     dest_root = st.text_input("Save downloads to", value=str(DEFAULT_DOWNLOAD_ROOT))
     st.caption("A subfolder is created per batch automatically.")
 
@@ -291,11 +370,13 @@ if download_clicked:
 
     with st.spinner("Reading your login and fetching the panel..."):
         try:
-            session = build_session(browser_name, panel_url)
+            session = build_session(browser_name, panel_url, custom_cookie_path)
         except Exception as e:
             st.error(
                 f"Couldn't read cookies from {browser_name} ({e}). "
-                f"Make sure {browser_name} is installed and you've logged into the panel there at least once."
+                f"Make sure {browser_name} is installed and you've logged into the panel there at least once. "
+                f"If auto-detection keeps failing, try the 'Custom cookie file path' field in the sidebar, "
+                f"or switch to Chrome/Edge/Brave if you're logged into the panel there too."
             )
             st.stop()
 
