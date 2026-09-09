@@ -22,6 +22,7 @@ import mimetypes
 import os
 import platform
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -69,6 +70,52 @@ BROWSER_COOKIE_LOADERS = {
     "Edge": browser_cookie3.edge,
     "Brave": browser_cookie3.brave,
 }
+
+
+# ---------------------------------------------------------------------------
+# WebDriver setup
+# ---------------------------------------------------------------------------
+
+def find_geckodriver():
+    """Look for geckodriver in common locations."""
+    # Check current working directory and subdirectories
+    cwd = Path.cwd()
+    for candidate in [
+        cwd / "geckodriver",
+        cwd / "geckodriver.exe",
+        cwd / "bin" / "geckodriver",
+        cwd / "bin" / "geckodriver.exe",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    
+    # Check if geckodriver is in PATH
+    gecko_path = shutil.which("geckodriver")
+    if gecko_path:
+        return gecko_path
+    
+    return None
+
+
+def find_chromedriver():
+    """Look for chromedriver in common locations."""
+    # Check current working directory and subdirectories
+    cwd = Path.cwd()
+    for candidate in [
+        cwd / "chromedriver",
+        cwd / "chromedriver.exe",
+        cwd / "bin" / "chromedriver",
+        cwd / "bin" / "chromedriver.exe",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    
+    # Check if chromedriver is in PATH
+    chrome_path = shutil.which("chromedriver")
+    if chrome_path:
+        return chrome_path
+    
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +277,7 @@ def looks_logged_out(html: str, status_code: int, final_url: str) -> bool:
     return len(html) < 4000 and any(s in lowered for s in signals)
 
 
-def fetch_with_selenium(session: requests.Session, url: str) -> tuple:
+def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str = "firefox") -> tuple:
     """Fetch page with Selenium to render JavaScript. Returns (html, error_message)."""
     try:
         from selenium import webdriver
@@ -242,24 +289,48 @@ def fetch_with_selenium(session: requests.Session, url: str) -> tuple:
         from selenium.common.exceptions import TimeoutException, WebDriverException
         
         driver = None
-        try:
-            # Try Firefox first (user is using Firefox)
-            options = FirefoxOptions()
-            options.add_argument("--headless")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            driver = webdriver.Firefox(options=options)
-        except WebDriverException:
-            # Fall back to Chrome if Firefox not available
+        error_messages = []
+        
+        # Try preferred browser first
+        browsers_to_try = []
+        if prefer_browser == "firefox":
+            browsers_to_try = ["firefox", "chrome"]
+        else:
+            browsers_to_try = ["chrome", "firefox"]
+        
+        for browser_type in browsers_to_try:
             try:
-                options = ChromeOptions()
-                options.add_argument("--headless")
-                options.add_argument("--no-sandbox")
-                options.add_argument("--disable-dev-shm-usage")
-                options.add_argument("--disable-gpu")
-                driver = webdriver.Chrome(options=options)
+                if browser_type == "firefox":
+                    gecko_path = find_geckodriver()
+                    if not gecko_path:
+                        error_messages.append("GeckoDriver not found - check /home/appuser/.cache/selenium/geckodriver/ or add geckodriver to PATH")
+                        continue
+                    
+                    options = FirefoxOptions()
+                    options.add_argument("--headless")
+                    options.add_argument("--no-sandbox")
+                    options.add_argument("--disable-dev-shm-usage")
+                    driver = webdriver.Firefox(service=webdriver.firefox.service.Service(gecko_path), options=options)
+                else:  # chrome
+                    chrome_path = find_chromedriver()
+                    if not chrome_path:
+                        error_messages.append("ChromeDriver not found - check /home/appuser/.cache/selenium/chromedriver/ or add chromedriver to PATH")
+                        continue
+                    
+                    options = ChromeOptions()
+                    options.add_argument("--headless")
+                    options.add_argument("--no-sandbox")
+                    options.add_argument("--disable-dev-shm-usage")
+                    options.add_argument("--disable-gpu")
+                    driver = webdriver.Chrome(service=webdriver.chrome.service.Service(chrome_path), options=options)
+                
+                break  # Successfully created driver
             except WebDriverException as e:
-                return None, f"Neither Firefox nor Chrome WebDriver available: {e}. Install geckodriver (Firefox) or chromedriver (Chrome)."
+                error_messages.append(f"{browser_type.capitalize()}: {str(e)[:100]}")
+                continue
+        
+        if driver is None:
+            return None, " | ".join(error_messages) or "Neither Firefox nor Chrome WebDriver available"
         
         # Add cookies to driver
         driver.get(url)
@@ -594,17 +665,26 @@ if download_clicked:
     if looks_logged_out(html, resp.status_code, resp.url):
         st.info("🤖 **Page appears to be dynamically rendered with JavaScript. Attempting to load with Selenium...**")
         
-        html, selenium_error = fetch_with_selenium(session, panel_url)
+        # Determine preferred browser based on what we're using for cookies
+        prefer_browser = "firefox" if browser_name == "Firefox" else "chrome"
+        html, selenium_error = fetch_with_selenium(session, panel_url, prefer_browser=prefer_browser)
         
         if html is None:
+            gecko_path = find_geckodriver()
+            chrome_path = find_chromedriver()
+            
             st.warning(
                 f"⚠️ **Page uses JavaScript to render content**\n\n"
                 f"Selenium error: {selenium_error}\n\n"
-                f"**To fix (you're using Firefox):**\n"
-                f"1. Download **GeckoDriver** from: https://github.com/mozilla/geckodriver/releases\n"
-                f"2. Extract it and add to your system PATH, or place in your project folder\n"
-                f"3. Restart Streamlit and try again\n\n"
-                f"**Alternative:** Use Chrome and download **ChromeDriver** from: https://chromedriver.chromium.org/"
+                f"**WebDriver Status:**\n"
+                f"- GeckoDriver (Firefox): {'✅ Found at ' + gecko_path if gecko_path else '❌ Not found'}\n"
+                f"- ChromeDriver (Chrome): {'✅ Found at ' + chrome_path if chrome_path else '❌ Not found'}\n\n"
+                f"**To fix:**\n"
+                f"1. Download and extract a WebDriver:\n"
+                f"   - **GeckoDriver**: https://github.com/mozilla/geckodriver/releases\n"
+                f"   - **ChromeDriver**: https://chromedriver.chromium.org/\n"
+                f"2. Place it in your project folder or add to system PATH\n"
+                f"3. Restart Streamlit and try again"
             )
             st.stop()
         else:
