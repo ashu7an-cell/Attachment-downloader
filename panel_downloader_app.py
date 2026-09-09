@@ -241,23 +241,25 @@ def fetch_with_selenium(session: requests.Session, url: str) -> tuple:
         from selenium.webdriver.support import expected_conditions as EC
         from selenium.common.exceptions import TimeoutException, WebDriverException
         
-        # Try Chrome first (more common)
         driver = None
         try:
-            options = ChromeOptions()
+            # Try Firefox first (user is using Firefox)
+            options = FirefoxOptions()
             options.add_argument("--headless")
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-gpu")
-            driver = webdriver.Chrome(options=options)
+            driver = webdriver.Firefox(options=options)
         except WebDriverException:
-            # Fall back to Firefox if Chrome not available
+            # Fall back to Chrome if Firefox not available
             try:
-                options = FirefoxOptions()
+                options = ChromeOptions()
                 options.add_argument("--headless")
-                driver = webdriver.Firefox(options=options)
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--disable-gpu")
+                driver = webdriver.Chrome(options=options)
             except WebDriverException as e:
-                return None, f"Selenium WebDriver not available: {e}. Install chromedriver or geckodriver."
+                return None, f"Neither Firefox nor Chrome WebDriver available: {e}. Install geckodriver (Firefox) or chromedriver (Chrome)."
         
         # Add cookies to driver
         driver.get(url)
@@ -598,10 +600,11 @@ if download_clicked:
             st.warning(
                 f"⚠️ **Page uses JavaScript to render content**\n\n"
                 f"Selenium error: {selenium_error}\n\n"
-                f"**To fix:**\n"
-                f"1. If running locally, install chromedriver: https://chromedriver.chromium.org/\n"
-                f"2. If on Streamlit Cloud, JavaScript rendering is not yet available\n"
-                f"3. Check Diagnostics section for the raw HTML to debug further"
+                f"**To fix (you're using Firefox):**\n"
+                f"1. Download **GeckoDriver** from: https://github.com/mozilla/geckodriver/releases\n"
+                f"2. Extract it and add to your system PATH, or place in your project folder\n"
+                f"3. Restart Streamlit and try again\n\n"
+                f"**Alternative:** Use Chrome and download **ChromeDriver** from: https://chromedriver.chromium.org/"
             )
             st.stop()
         else:
