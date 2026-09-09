@@ -8,6 +8,11 @@ This app can work in two ways:
 1. Local mode: Reads cookies directly from your browser (Chrome, Firefox, Edge, Brave)
 2. Cloud mode: You provide your cookies manually via a cookie file
 
+Features:
+- Automatically detects JavaScript-rendered pages and handles them with Selenium
+- Extracts files from HTML, images, data attributes, and script tags
+- Supports batch downloads with progress tracking
+
 Run with:
     pip install -r requirements.txt
     streamlit run panel_downloader_app.py
@@ -223,6 +228,70 @@ def looks_logged_out(html: str, status_code: int, final_url: str) -> bool:
     # Weak heuristic: only flag if the page is short AND mentions a login-ish word,
     # since panel pages may legitimately contain the word "login" somewhere in a menu.
     return len(html) < 4000 and any(s in lowered for s in signals)
+
+
+def fetch_with_selenium(session: requests.Session, url: str) -> tuple:
+    """Fetch page with Selenium to render JavaScript. Returns (html, error_message)."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+        
+        # Try Chrome first (more common)
+        driver = None
+        try:
+            options = ChromeOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            driver = webdriver.Chrome(options=options)
+        except WebDriverException:
+            # Fall back to Firefox if Chrome not available
+            try:
+                options = FirefoxOptions()
+                options.add_argument("--headless")
+                driver = webdriver.Firefox(options=options)
+            except WebDriverException as e:
+                return None, f"Selenium WebDriver not available: {e}. Install chromedriver or geckodriver."
+        
+        # Add cookies to driver
+        driver.get(url)
+        for cookie in session.cookies:
+            try:
+                driver.add_cookie({
+                    'name': cookie.name,
+                    'value': cookie.value,
+                    'domain': cookie.domain,
+                    'path': cookie.path or '/',
+                })
+            except Exception:
+                pass  # Skip cookies that can't be added
+        
+        # Reload page with cookies
+        driver.get(url)
+        
+        # Wait for page to load (up to 10 seconds)
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            pass  # Continue even if timeout
+        
+        # Give JavaScript time to render
+        time.sleep(2)
+        
+        html = driver.page_source
+        driver.quit()
+        
+        return html, ""
+    except Exception as e:
+        return None, f"Selenium rendering failed: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -521,13 +590,22 @@ if download_clicked:
         st.stop()
 
     if looks_logged_out(html, resp.status_code, resp.url):
-        st.error(
-            "⚠️ **Cookies found, but page looks like a login screen**\n\n"
-            "**Possible causes:**\n"
-            "- Session expired (log in again in your browser)\n"
-            "- Page uses JavaScript to render (check Diagnostics)"
-        )
-        st.stop()
+        st.info("🤖 **Page appears to be dynamically rendered with JavaScript. Attempting to load with Selenium...**")
+        
+        html, selenium_error = fetch_with_selenium(session, panel_url)
+        
+        if html is None:
+            st.warning(
+                f"⚠️ **Page uses JavaScript to render content**\n\n"
+                f"Selenium error: {selenium_error}\n\n"
+                f"**To fix:**\n"
+                f"1. If running locally, install chromedriver: https://chromedriver.chromium.org/\n"
+                f"2. If on Streamlit Cloud, JavaScript rendering is not yet available\n"
+                f"3. Check Diagnostics section for the raw HTML to debug further"
+            )
+            st.stop()
+        else:
+            st.success("✅ Page loaded with Selenium successfully!")
 
     attachments = extract_attachments(html, panel_url)
 
