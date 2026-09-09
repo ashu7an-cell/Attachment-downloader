@@ -88,12 +88,12 @@ def find_geckodriver():
     ]:
         if candidate.exists():
             return str(candidate)
-    
+
     # Check if geckodriver is in PATH
     gecko_path = shutil.which("geckodriver")
     if gecko_path:
         return gecko_path
-    
+
     return None
 
 
@@ -109,12 +109,12 @@ def find_chromedriver():
     ]:
         if candidate.exists():
             return str(candidate)
-    
+
     # Check if chromedriver is in PATH
     chrome_path = shutil.which("chromedriver")
     if chrome_path:
         return chrome_path
-    
+
     return None
 
 
@@ -209,21 +209,21 @@ def build_session_from_cookies_file(cookies_file) -> tuple:
     """Build session from uploaded cookies.sqlite file (Firefox/Chrome format)."""
     try:
         import sqlite3
-        
+
         # Save uploaded file temporarily
         temp_path = Path("/tmp/cookies_temp.sqlite")
         temp_path.write_bytes(cookies_file.read())
-        
+
         # Load cookies using browser_cookie3 with the temp file
         # Try Firefox first, then Chrome format
         try:
             cookiejar = browser_cookie3.firefox(cookie_file=str(temp_path))
-        except:
+        except Exception:
             try:
                 cookiejar = browser_cookie3.chrome(cookie_file=str(temp_path))
             except Exception as e:
                 return None, f"Could not read cookies file: {e}"
-        
+
         session = requests.Session()
         session.cookies.update(cookiejar)
         session.headers.update(
@@ -232,7 +232,7 @@ def build_session_from_cookies_file(cookies_file) -> tuple:
                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             }
         )
-        
+
         # Clean up
         temp_path.unlink(missing_ok=True)
         return session, ""
@@ -247,14 +247,14 @@ def auto_detect_browser_with_cookies(panel_domain: str) -> str:
             session, error = try_build_session(browser_name, f"https://{panel_domain}", "")
             if session is None:
                 continue
-            
+
             # Check if session has cookies for the panel domain
             matched_cookies = cookies_for_domain(session, panel_domain)
             if matched_cookies:
                 return browser_name
         except Exception:
             continue
-    
+
     return None
 
 
@@ -287,17 +287,17 @@ def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
         from selenium.common.exceptions import TimeoutException, WebDriverException
-        
+
         driver = None
         error_messages = []
-        
+
         # Try preferred browser first
         browsers_to_try = []
         if prefer_browser == "firefox":
             browsers_to_try = ["firefox", "chrome"]
         else:
             browsers_to_try = ["chrome", "firefox"]
-        
+
         for browser_type in browsers_to_try:
             try:
                 if browser_type == "firefox":
@@ -305,7 +305,7 @@ def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str
                     if not gecko_path:
                         error_messages.append("GeckoDriver not found - check /home/appuser/.cache/selenium/geckodriver/ or add geckodriver to PATH")
                         continue
-                    
+
                     options = FirefoxOptions()
                     options.add_argument("--headless")
                     options.add_argument("--no-sandbox")
@@ -316,22 +316,22 @@ def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str
                     if not chrome_path:
                         error_messages.append("ChromeDriver not found - check /home/appuser/.cache/selenium/chromedriver/ or add chromedriver to PATH")
                         continue
-                    
+
                     options = ChromeOptions()
                     options.add_argument("--headless")
                     options.add_argument("--no-sandbox")
                     options.add_argument("--disable-dev-shm-usage")
                     options.add_argument("--disable-gpu")
                     driver = webdriver.Chrome(service=webdriver.chrome.service.Service(chrome_path), options=options)
-                
+
                 break  # Successfully created driver
             except WebDriverException as e:
                 error_messages.append(f"{browser_type.capitalize()}: {str(e)[:100]}")
                 continue
-        
+
         if driver is None:
             return None, " | ".join(error_messages) or "Neither Firefox nor Chrome WebDriver available"
-        
+
         # Add cookies to driver
         driver.get(url)
         for cookie in session.cookies:
@@ -344,10 +344,10 @@ def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str
                 })
             except Exception:
                 pass  # Skip cookies that can't be added
-        
+
         # Reload page with cookies
         driver.get(url)
-        
+
         # Wait for page to load (up to 10 seconds)
         try:
             WebDriverWait(driver, 10).until(
@@ -355,13 +355,13 @@ def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str
             )
         except TimeoutException:
             pass  # Continue even if timeout
-        
+
         # Give JavaScript time to render
         time.sleep(2)
-        
+
         html = driver.page_source
         driver.quit()
-        
+
         return html, ""
     except Exception as e:
         return None, f"Selenium rendering failed: {e}"
@@ -538,36 +538,49 @@ if "last_dest_root" not in st.session_state:
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    
+
+    # FIX: define browser_name up front so it always exists, regardless of
+    # which branch (local vs. remote) below actually runs. Previously this
+    # was only ever assigned inside the local-mode branch, which caused a
+    # NameError anywhere it was referenced later (e.g. try_build_session,
+    # prefer_browser) while running in remote/cloud mode.
+    browser_name = None
+    uploaded_cookies = None
+
     # Check if running in cloud/remote environment
     is_remote = "/mount/src/" in os.getcwd() or "streamlit" in os.getcwd()
-    
+
     if is_remote:
         st.info("🌐 **Cloud Mode** - Upload your cookies file")
         st.write("Since this is running on a server, you need to provide cookies manually:")
-        
+
         # Option 1: Upload cookies.sqlite file
         uploaded_cookies = st.file_uploader(
             "📁 Upload cookies.sqlite from your browser",
             type=["sqlite", "db"],
             help="For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\[profile]\\cookies.sqlite\nFor Chrome: %APPDATA%\\..\\Local\\Google\\Chrome\\User Data\\Default\\Cookies"
         )
-        
+
         if uploaded_cookies:
             session_obj = None
             error_msg = ""
         else:
             session_obj = None
             error_msg = "Please upload your cookies.sqlite file"
+
+        # FIX: harmless default for the later Selenium prefer_browser logic.
+        # build_session_from_cookies_file() already auto-detects Firefox vs.
+        # Chrome cookie formats, so this value isn't used for auth itself.
+        browser_name = "Chrome"
     else:
         st.info("💻 **Local Mode** - Using your browser cookies")
-        
+
         # Auto-detect browser with 99acres cookies
         if st.session_state.auto_detected_browser is None:
             st.info("🔍 Auto-detecting browser with 99acres login...")
             auto_detected = auto_detect_browser_with_cookies(PANEL_DOMAIN)
             st.session_state.auto_detected_browser = auto_detected or False  # False means tried and failed
-        
+
         if st.session_state.auto_detected_browser:
             st.success(f"✅ Found active login in **{st.session_state.auto_detected_browser}**")
             browser_name = st.session_state.auto_detected_browser
@@ -588,15 +601,15 @@ with st.sidebar:
                 "Select browser manually",
                 list(BROWSER_COOKIE_LOADERS.keys()),
             )
-        
+
         uploaded_cookies = None
-    
+
     custom_cookie_path = st.text_input(
         "Custom cookie file path (optional)",
         value="",
         help="For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite",
     )
-    
+
     dest_root = st.text_input(
         "Save downloads to",
         value=st.session_state.last_dest_root,
@@ -614,6 +627,14 @@ download_clicked = st.button("⬇️ Download all attachments", type="primary", 
 if download_clicked:
     domain = urlparse(panel_url).netloc
     is_remote = "/mount/src/" in os.getcwd() or "streamlit" in os.getcwd()
+
+    # FIX: actually enforce the "please upload cookies" requirement in remote
+    # mode instead of just setting an unused error_msg string. Previously the
+    # download button stayed active and clicking it fell through to
+    # try_build_session(browser_name, ...) with browser_name undefined.
+    if is_remote and not uploaded_cookies:
+        st.error("❌ Please upload your cookies.sqlite file in the sidebar first.")
+        st.stop()
 
     with st.spinner("Reading your login and fetching the panel..."):
         try:
@@ -664,15 +685,15 @@ if download_clicked:
 
     if looks_logged_out(html, resp.status_code, resp.url):
         st.info("🤖 **Page appears to be dynamically rendered with JavaScript. Attempting to load with Selenium...**")
-        
+
         # Determine preferred browser based on what we're using for cookies
         prefer_browser = "firefox" if browser_name == "Firefox" else "chrome"
         html, selenium_error = fetch_with_selenium(session, panel_url, prefer_browser=prefer_browser)
-        
+
         if html is None:
             gecko_path = find_geckodriver()
             chrome_path = find_chromedriver()
-            
+
             st.warning(
                 f"⚠️ **Page uses JavaScript to render content**\n\n"
                 f"Selenium error: {selenium_error}\n\n"
