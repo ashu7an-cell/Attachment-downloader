@@ -35,6 +35,7 @@ st.set_page_config(page_title="Sales Panel Bulk Downloader", layout="centered")
 
 DEFAULT_DOWNLOAD_ROOT = Path.home() / "Downloads" / "SalesPanelAttachments"
 PANEL_DOMAIN = "99acres.com"
+PANEL_LOGIN_URL = "https://www.99acres.com/opspanel/login"
 
 # Known file extensions - still the strongest signal when present.
 FILE_EXT_PATTERN = re.compile(
@@ -438,7 +439,7 @@ with st.sidebar:
             st.warning("⚠️ No active 99acres login found in any browser")
             st.info("**How to fix:**")
             st.write("1. Open Chrome, Firefox, Edge, or Brave")
-            st.write("2. Visit https://www.99acres.com")
+            st.write(f"2. Visit {PANEL_LOGIN_URL}")
             st.write("3. Log in with your credentials")
             st.write("4. Return here and try again")
             browser_name = st.selectbox(
@@ -489,7 +490,7 @@ if download_clicked:
                 f"❌ **Couldn't read cookies**: {e}\n\n"
                 f"**Try this:**\n"
                 f"1. Make sure your cookies file is valid\n"
-                f"2. Visit https://www.99acres.com and log in\n"
+                f"2. Visit {PANEL_LOGIN_URL} and log in\n"
                 f"3. Upload your cookies.sqlite file"
             )
             st.stop()
