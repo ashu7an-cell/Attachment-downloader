@@ -1,749 +1,234 @@
-"""
-Sales Panel Bulk Downloader
-----------------------------
-Paste a sales panel link, click Download, and every attachment (brochure,
-images, etc.) is saved straight into a folder on your laptop.
-
-This app can work in two ways:
-1. Local mode: Reads cookies directly from your browser (Chrome, Firefox, Edge, Brave)
-2. Cloud mode: You provide your cookies manually via a cookie file
-
-Features:
-- Automatically detects JavaScript-rendered pages and handles them with Selenium
-- Extracts files from HTML, images, data attributes, and script tags
-- Supports batch downloads with progress tracking
-
-Run with:
-    pip install -r requirements.txt
-    streamlit run panel_downloader_app.py
-"""
-
-import mimetypes
 import os
-import platform
 import re
-import shutil
-import subprocess
 import time
-from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
-
-import browser_cookie3
+import urllib.parse
+import concurrent.futures
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-st.set_page_config(page_title="Sales Panel Bulk Downloader", layout="centered")
+st.set_page_config(page_title="99acres Downloader", page_icon="📥", layout="wide")
+st.title("📥 99acres Fast Persistent Downloader")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+SESSION_DIR = "./browser_session"
 
-DEFAULT_DOWNLOAD_ROOT = Path.home() / "Downloads" / "SalesPanelAttachments"
-PANEL_DOMAIN = "99acres.com"
-PANEL_LOGIN_URL = "https://www.99acres.com/opspanel/login"
+# --- Session State Persistence ---
+if "download_dir" not in st.session_state:
+    st.session_state.download_dir = "./downloads"
+if "panel_url" not in st.session_state:
+    st.session_state.panel_url = ""
+if "last_processed_url" not in st.session_state:
+    st.session_state.last_processed_url = ""
 
-# Known file extensions - still the strongest signal when present.
-FILE_EXT_PATTERN = re.compile(
-    r"\.(pdf|jpe?g|png|gif|webp|bmp|svg|docx?|xlsx?|pptx?|mp4|mov|zip)(\?|$)",
-    re.IGNORECASE,
+output_folder = st.sidebar.text_input(
+    "Local Download Directory", 
+    value=st.session_state.download_dir,
+    key="download_dir_input"
 )
-URL_IN_TEXT_PATTERN = re.compile(r'https?://[^\s"\'<>\\]+')
+st.session_state.download_dir = output_folder
 
-# Fallback signal: many panels serve files through extension-less API
-# endpoints. If a link's path or query string contains one of these words,
-# treat it as a likely attachment even without a recognizable extension.
-ATTACHMENT_KEYWORD_PATTERN = re.compile(
-    r"(download|attachment|brochure|document|media|asset|file|cdn|export)",
-    re.IGNORECASE,
+content_wait_seconds = st.sidebar.number_input(
+    "Max seconds to wait for panel content", value=45, min_value=10
 )
-
-# JSON-ish "key": "https://..." pairs where the key name suggests a file link,
-# e.g. "fileUrl": "https://.../x", "docUrl": "...", "attachmentUrl": "..."
-JSON_URL_KEY_PATTERN = re.compile(
-    r'["\'](?:file|doc|attachment|brochure|image|img|media)?[uU]rl["\']\s*:\s*["\'](https?://[^"\']+)["\']'
-)
-
-BROWSER_COOKIE_LOADERS = {
-    "Chrome": browser_cookie3.chrome,
-    "Firefox": browser_cookie3.firefox,
-    "Edge": browser_cookie3.edge,
-    "Brave": browser_cookie3.brave,
-}
-
-
-# ---------------------------------------------------------------------------
-# WebDriver setup
-# ---------------------------------------------------------------------------
-
-def find_geckodriver():
-    """Look for geckodriver in common locations."""
-    # Check current working directory and subdirectories
-    cwd = Path.cwd()
-    for candidate in [
-        cwd / "geckodriver",
-        cwd / "geckodriver.exe",
-        cwd / "bin" / "geckodriver",
-        cwd / "bin" / "geckodriver.exe",
-    ]:
-        if candidate.exists():
-            return str(candidate)
-
-    # Check if geckodriver is in PATH
-    gecko_path = shutil.which("geckodriver")
-    if gecko_path:
-        return gecko_path
-
-    return None
-
-
-def find_chromedriver():
-    """Look for chromedriver in common locations."""
-    # Check current working directory and subdirectories
-    cwd = Path.cwd()
-    for candidate in [
-        cwd / "chromedriver",
-        cwd / "chromedriver.exe",
-        cwd / "bin" / "chromedriver",
-        cwd / "bin" / "chromedriver.exe",
-    ]:
-        if candidate.exists():
-            return str(candidate)
-
-    # Check if chromedriver is in PATH
-    chrome_path = shutil.which("chromedriver")
-    if chrome_path:
-        return chrome_path
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Profile auto-detection (fallback for when browser_cookie3 can't find it)
-# ---------------------------------------------------------------------------
-
-def _candidate_firefox_roots():
-    """Known Firefox profile-root locations across OS + install methods.
-
-    browser_cookie3 only checks the "normal" install location. It misses
-    Firefox installed via the Microsoft Store on Windows (profiles live under
-    a sandboxed Packages\\ folder) and Linux snap/flatpak installs.
-    """
-    system = platform.system()
-    home = Path.home()
-    candidates = []
-
-    if system == "Windows":
-        appdata = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming")))
-        candidates.append(appdata / "Mozilla" / "Firefox" / "Profiles")
-
-        localappdata = Path(os.environ.get("LOCALAPPDATA", str(home / "AppData" / "Local")))
-        packages_dir = localappdata / "Packages"
-        if packages_dir.exists():
-            for pkg in packages_dir.glob("Mozilla.Firefox_*"):
-                candidates.append(pkg / "LocalCache" / "Roaming" / "Mozilla" / "Firefox" / "Profiles")
-
-    elif system == "Darwin":
-        candidates.append(home / "Library" / "Application Support" / "Firefox" / "Profiles")
-
-    else:  # Linux and friends
-        candidates.append(home / ".mozilla" / "firefox")
-        candidates.append(home / "snap" / "firefox" / "common" / ".mozilla" / "firefox")
-        candidates.append(home / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox")
-
-    return candidates
-
-
-def locate_firefox_cookie_file():
-    """Search known profile roots for cookies.sqlite, preferring default-release."""
-    best = None
-    for root in _candidate_firefox_roots():
-        if not root.exists():
-            continue
-        matches = list(root.glob("*/cookies.sqlite"))
-        for path in matches:
-            rank = 0 if "default-release" in path.parent.name else 1 if "default" in path.parent.name else 2
-            if best is None or rank < best[0]:
-                best = (rank, path)
-    return best[1] if best else None
-
-
-# ---------------------------------------------------------------------------
-# Session / auth
-# ---------------------------------------------------------------------------
-
-def try_build_session(browser_name: str, panel_url: str, custom_cookie_path: str = "") -> tuple:
-    """Try to build a session and return (session, error_message). If successful, error_message is empty."""
-    loader = BROWSER_COOKIE_LOADERS[browser_name]
-    explicit_path = custom_cookie_path.strip() or None
-
-    try:
-        cookiejar = loader(cookie_file=explicit_path) if explicit_path else loader()
-    except Exception as primary_error:
-        # Auto-fallback for Firefox: try known profile locations
-        if browser_name == "Firefox" and not explicit_path:
-            fallback_path = locate_firefox_cookie_file()
-            if fallback_path:
-                try:
-                    cookiejar = loader(cookie_file=str(fallback_path))
-                except Exception as fallback_error:
-                    return None, f"Firefox cookie detection failed: {fallback_error}"
-            else:
-                return None, f"{primary_error}. Auto-detection also failed."
-        else:
-            return None, str(primary_error)
-
-    session = requests.Session()
-    session.cookies.update(cookiejar)
-    session.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Referer": panel_url,
-        }
-    )
-    return session, ""
-
-
-def build_session_from_cookies_file(cookies_file) -> tuple:
-    """Build session from uploaded cookies.sqlite file (Firefox/Chrome format)."""
-    try:
-        import sqlite3
-
-        # Save uploaded file temporarily
-        temp_path = Path("/tmp/cookies_temp.sqlite")
-        temp_path.write_bytes(cookies_file.read())
-
-        # Load cookies using browser_cookie3 with the temp file
-        # Try Firefox first, then Chrome format
-        try:
-            cookiejar = browser_cookie3.firefox(cookie_file=str(temp_path))
-        except Exception:
-            try:
-                cookiejar = browser_cookie3.chrome(cookie_file=str(temp_path))
-            except Exception as e:
-                return None, f"Could not read cookies file: {e}"
-
-        session = requests.Session()
-        session.cookies.update(cookiejar)
-        session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            }
-        )
-
-        # Clean up
-        temp_path.unlink(missing_ok=True)
-        return session, ""
-    except Exception as e:
-        return None, f"Error reading cookies file: {e}"
-
-
-def auto_detect_browser_with_cookies(panel_domain: str) -> str:
-    """Try each browser in order and return the first one that has cookies for the panel domain."""
-    for browser_name in BROWSER_COOKIE_LOADERS.keys():
-        try:
-            session, error = try_build_session(browser_name, f"https://{panel_domain}", "")
-            if session is None:
-                continue
-
-            # Check if session has cookies for the panel domain
-            matched_cookies = cookies_for_domain(session, panel_domain)
-            if matched_cookies:
-                return browser_name
-        except Exception:
-            continue
-
-    return None
-
-
-def cookies_for_domain(session: requests.Session, domain: str):
-    """Cookies in the jar whose domain matches (loosely) the target site - for diagnostics only."""
-    root = ".".join(domain.split(".")[-2:]) if domain.count(".") >= 1 else domain
-    return [c for c in session.cookies if root in c.domain]
-
-
-def looks_logged_out(html: str, status_code: int, final_url: str) -> bool:
-    if status_code in (401, 403):
-        return True
-    lowered = html.lower()
-    signals = ["login", "log in", "sign in", "sso", "session expired", "unauthorized"]
-    url_lowered = final_url.lower()
-    if any(s.replace(" ", "") in url_lowered for s in ("login", "sso", "signin")):
-        return True
-    # Weak heuristic: only flag if the page is short AND mentions a login-ish word,
-    # since panel pages may legitimately contain the word "login" somewhere in a menu.
-    return len(html) < 4000 and any(s in lowered for s in signals)
-
-
-def fetch_with_selenium(session: requests.Session, url: str, prefer_browser: str = "firefox") -> tuple:
-    """Fetch page with Selenium to render JavaScript. Returns (html, error_message)."""
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options as ChromeOptions
-        from selenium.webdriver.firefox.options import Options as FirefoxOptions
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import TimeoutException, WebDriverException
-
-        driver = None
-        error_messages = []
-
-        # Try preferred browser first
-        browsers_to_try = []
-        if prefer_browser == "firefox":
-            browsers_to_try = ["firefox", "chrome"]
-        else:
-            browsers_to_try = ["chrome", "firefox"]
-
-        for browser_type in browsers_to_try:
-            try:
-                if browser_type == "firefox":
-                    gecko_path = find_geckodriver()
-                    if not gecko_path:
-                        error_messages.append("GeckoDriver not found - check /home/appuser/.cache/selenium/geckodriver/ or add geckodriver to PATH")
-                        continue
-
-                    options = FirefoxOptions()
-                    options.add_argument("--headless")
-                    options.add_argument("--no-sandbox")
-                    options.add_argument("--disable-dev-shm-usage")
-                    driver = webdriver.Firefox(service=webdriver.firefox.service.Service(gecko_path), options=options)
-                else:  # chrome
-                    chrome_path = find_chromedriver()
-                    if not chrome_path:
-                        error_messages.append("ChromeDriver not found - check /home/appuser/.cache/selenium/chromedriver/ or add chromedriver to PATH")
-                        continue
-
-                    options = ChromeOptions()
-                    options.add_argument("--headless")
-                    options.add_argument("--no-sandbox")
-                    options.add_argument("--disable-dev-shm-usage")
-                    options.add_argument("--disable-gpu")
-                    driver = webdriver.Chrome(service=webdriver.chrome.service.Service(chrome_path), options=options)
-
-                break  # Successfully created driver
-            except WebDriverException as e:
-                error_messages.append(f"{browser_type.capitalize()}: {str(e)[:100]}")
-                continue
-
-        if driver is None:
-            return None, " | ".join(error_messages) or "Neither Firefox nor Chrome WebDriver available"
-
-        # Add cookies to driver
-        driver.get(url)
-        for cookie in session.cookies:
-            try:
-                driver.add_cookie({
-                    'name': cookie.name,
-                    'value': cookie.value,
-                    'domain': cookie.domain,
-                    'path': cookie.path or '/',
-                })
-            except Exception:
-                pass  # Skip cookies that can't be added
-
-        # Reload page with cookies
-        driver.get(url)
-
-        # Wait for page to load (up to 10 seconds)
-        try:
-            WebDriverWait(driver, 10).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-        except TimeoutException:
-            pass  # Continue even if timeout
-
-        # Give JavaScript time to render
-        time.sleep(2)
-
-        html = driver.page_source
-        driver.quit()
-
-        return html, ""
-    except Exception as e:
-        return None, f"Selenium rendering failed: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Attachment discovery
-# ---------------------------------------------------------------------------
-
-def guess_label(tag) -> str:
-    node = tag
-    for _ in range(6):
-        if node is None:
-            break
-        node = node.find_previous(["h1", "h2", "h3", "h4", "label", "strong", "span"])
-        if node and node.get_text(strip=True):
-            text = node.get_text(strip=True)
-            if 0 < len(text) < 60:
-                return text
-    return ""
-
-
-def _looks_like_attachment(url: str) -> bool:
-    if FILE_EXT_PATTERN.search(url):
-        return True
-    return bool(ATTACHMENT_KEYWORD_PATTERN.search(url))
-
-
-def extract_attachments(html: str, base_url: str):
-    soup = BeautifulSoup(html, "html.parser")
-    found = {}
-
-    def add(url, label):
-        if url not in found:
-            found[url] = {"url": url, "label": label}
-
-    # 1. Anchor tags - either a known extension, or a URL that otherwise
-    #    smells like a download/attachment endpoint.
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        abs_url = urljoin(base_url, href)
-        if _looks_like_attachment(abs_url):
-            add(abs_url, guess_label(a) or a.get_text(strip=True) or "file")
-
-    # 2. Images - always candidates.
-    for img in soup.find_all("img", src=True):
-        abs_url = urljoin(base_url, img["src"])
-        add(abs_url, guess_label(img) or "image")
-
-    # 3. Any element carrying a data-* attribute that itself looks like a
-    #    file URL or path (common pattern for JS-driven download buttons).
-    for tag in soup.find_all(True):
-        for attr_name, attr_val in tag.attrs.items():
-            if not attr_name.startswith("data-") or not isinstance(attr_val, str):
-                continue
-            if attr_val.startswith("http") or attr_val.startswith("/"):
-                abs_url = urljoin(base_url, attr_val)
-                if _looks_like_attachment(abs_url):
-                    add(abs_url, guess_label(tag) or "file")
-
-    # 4. Script tags - scan full text (not just .string, which misses
-    #    anything but a single uninterrupted text node), for both bare URLs
-    #    and "xUrl": "..." JSON-style key/value pairs.
-    for script in soup.find_all("script"):
-        text = script.get_text() or ""
-        if not text:
-            continue
-        for m in URL_IN_TEXT_PATTERN.finditer(text):
-            url = m.group(0).rstrip('\\",)')
-            if _looks_like_attachment(url):
-                add(url, "file")
-        for m in JSON_URL_KEY_PATTERN.finditer(text):
-            url = m.group(1).rstrip('\\",)')
-            add(urljoin(base_url, url), "file")
-
-    return list(found.values())
-
-
-def sanitize_filename(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip()
-    return name or "file"
-
-
-def batch_id_from_url(url: str) -> str:
-    qs = parse_qs(urlparse(url).query)
-    return qs.get("batchId", ["download"])[0]
-
-
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-
-def _extension_from_response(resp, fallback_url: str) -> str:
-    """Best-effort extension: Content-Disposition > Content-Type > URL path."""
-    cd = resp.headers.get("content-disposition", "")
-    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
-    if m:
-        name = m.group(1)
-        if "." in name:
-            return "." + name.rsplit(".", 1)[-1]
-
-    ext_match = re.search(r"\.(\w{2,5})(?:\?|$)", urlparse(fallback_url).path)
-    if ext_match:
-        return "." + ext_match.group(1)
-
-    content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-    guessed = mimetypes.guess_extension(content_type) if content_type else None
-    return guessed or ""
-
-
-def download_all(session: requests.Session, files, dest_folder: Path):
-    dest_folder.mkdir(parents=True, exist_ok=True)
-    results = []
-    progress = st.progress(0.0, text="Downloading...")
-    for i, f in enumerate(files):
-        url = f["url"]
-        try:
-            resp = session.get(url, timeout=60)
-            resp.raise_for_status()
-
-            content_type = resp.headers.get("content-type", "").lower()
-            if "text/html" in content_type and not url.lower().endswith((".html", ".htm")):
-                # We asked for a file and got an HTML page back - almost
-                # always means the session got logged out mid-run, or this
-                # particular link needs a different auth path.
-                raise ValueError("received an HTML page instead of a file (likely a login/redirect page)")
-
-            base_name = urlparse(url).path.split("/")[-1] or f["label"] or f"file_{i}"
-            base_name = sanitize_filename(base_name)
-            if "." not in base_name:
-                base_name += _extension_from_response(resp, url)
-
-            dest_path = dest_folder / base_name
-            counter = 1
-            while dest_path.exists():
-                stem, dot, ext = base_name.rpartition(".")
-                dest_path = dest_folder / (f"{stem}_{counter}.{ext}" if dot else f"{base_name}_{counter}")
-                counter += 1
-
-            dest_path.write_bytes(resp.content)
-            results.append((url, dest_path, None))
-        except Exception as e:
-            results.append((url, None, str(e)))
-        progress.progress((i + 1) / len(files), text=f"Downloading... ({i+1}/{len(files)})")
-    progress.empty()
-    return results
-
-
-def open_folder(path: Path):
-    system = platform.system()
-    try:
-        if system == "Windows":
-            os.startfile(path)  # type: ignore[attr-defined]
-        elif system == "Darwin":
-            subprocess.run(["open", str(path)])
-        else:
-            subprocess.run(["xdg-open", str(path)])
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
-
-st.title("📦 Sales Panel Bulk Downloader")
-st.caption("Paste the panel link. Files are saved straight to a folder on your laptop.")
-
-# Initialize session state
-if "auto_detected_browser" not in st.session_state:
-    st.session_state.auto_detected_browser = None
-if "last_dest_root" not in st.session_state:
-    st.session_state.last_dest_root = str(DEFAULT_DOWNLOAD_ROOT)
-
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    # FIX: define browser_name up front so it always exists, regardless of
-    # which branch (local vs. remote) below actually runs. Previously this
-    # was only ever assigned inside the local-mode branch, which caused a
-    # NameError anywhere it was referenced later (e.g. try_build_session,
-    # prefer_browser) while running in remote/cloud mode.
-    browser_name = None
-    uploaded_cookies = None
-
-    # Check if running in cloud/remote environment
-    is_remote = "/mount/src/" in os.getcwd() or "streamlit" in os.getcwd()
-
-    if is_remote:
-        st.info("🌐 **Cloud Mode** - Upload your cookies file")
-        st.write("Since this is running on a server, you need to provide cookies manually:")
-
-        # Option 1: Upload cookies.sqlite file
-        uploaded_cookies = st.file_uploader(
-            "📁 Upload cookies.sqlite from your browser",
-            type=["sqlite", "db"],
-            help="For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\[profile]\\cookies.sqlite\nFor Chrome: %APPDATA%\\..\\Local\\Google\\Chrome\\User Data\\Default\\Cookies"
-        )
-
-        if uploaded_cookies:
-            session_obj = None
-            error_msg = ""
-        else:
-            session_obj = None
-            error_msg = "Please upload your cookies.sqlite file"
-
-        # FIX: harmless default for the later Selenium prefer_browser logic.
-        # build_session_from_cookies_file() already auto-detects Firefox vs.
-        # Chrome cookie formats, so this value isn't used for auth itself.
-        browser_name = "Chrome"
-    else:
-        st.info("💻 **Local Mode** - Using your browser cookies")
-
-        # Auto-detect browser with 99acres cookies
-        if st.session_state.auto_detected_browser is None:
-            st.info("🔍 Auto-detecting browser with 99acres login...")
-            auto_detected = auto_detect_browser_with_cookies(PANEL_DOMAIN)
-            st.session_state.auto_detected_browser = auto_detected or False  # False means tried and failed
-
-        if st.session_state.auto_detected_browser:
-            st.success(f"✅ Found active login in **{st.session_state.auto_detected_browser}**")
-            browser_name = st.session_state.auto_detected_browser
-            st.caption("Auto-detected - change below if needed")
-            browser_name = st.selectbox(
-                "Browser",
-                list(BROWSER_COOKIE_LOADERS.keys()),
-                index=list(BROWSER_COOKIE_LOADERS.keys()).index(browser_name),
-            )
-        else:
-            st.warning("⚠️ No active 99acres login found in any browser")
-            st.info("**How to fix:**")
-            st.write("1. Open Chrome, Firefox, Edge, or Brave")
-            st.write(f"2. Visit {PANEL_LOGIN_URL}")
-            st.write("3. Log in with your credentials")
-            st.write("4. Return here and try again")
-            browser_name = st.selectbox(
-                "Select browser manually",
-                list(BROWSER_COOKIE_LOADERS.keys()),
-            )
-
-        uploaded_cookies = None
-
-    custom_cookie_path = st.text_input(
-        "Custom cookie file path (optional)",
-        value="",
-        help="For Firefox: %APPDATA%\\Mozilla\\Firefox\\Profiles\\xxxx.default-release\\cookies.sqlite",
-    )
-
-    dest_root = st.text_input(
-        "Save downloads to",
-        value=st.session_state.last_dest_root,
-        help="Files will be organized in subfolders by batch.",
-    )
-    st.session_state.last_dest_root = dest_root
 
 panel_url = st.text_input(
-    "Sales panel link",
-    placeholder="https://www.99acres.com/opspanel/sales-agent-doc-view-panel?batchId=SALES_6a9e6ecddf034b06fecd73d6",
+    "Sales Panel Link (Paste & Press Enter to auto-download):",
+    value=st.session_state.panel_url,
+    placeholder="https://www.99acres.com/opspanel/sales-agent-doc-view-panel?batchId=...",
+    key="panel_url_input"
 )
+st.session_state.panel_url = panel_url
 
-download_clicked = st.button("⬇️ Download all attachments", type="primary", disabled=not panel_url)
 
-if download_clicked:
-    domain = urlparse(panel_url).netloc
-    is_remote = "/mount/src/" in os.getcwd() or "streamlit" in os.getcwd()
+class BrowserManager:
+    """Owns all Playwright objects on a single worker thread."""
 
-    # FIX: actually enforce the "please upload cookies" requirement in remote
-    # mode instead of just setting an unused error_msg string. Previously the
-    # download button stayed active and clicking it fell through to
-    # try_build_session(browser_name, ...) with browser_name undefined.
-    if is_remote and not uploaded_cookies:
-        st.error("❌ Please upload your cookies.sqlite file in the sidebar first.")
-        st.stop()
+    def __init__(self):
+        self.pw = None
+        self.context = None
+        self.page = None
 
-    with st.spinner("Reading your login and fetching the panel..."):
-        try:
-            if is_remote and uploaded_cookies:
-                # Cloud mode: use uploaded cookies file
-                session, error = build_session_from_cookies_file(uploaded_cookies)
-                if session is None:
-                    raise RuntimeError(error)
-            else:
-                # Local mode: use browser cookies
-                session, error = try_build_session(browser_name, panel_url, custom_cookie_path)
-                if session is None:
-                    raise RuntimeError(error)
-        except Exception as e:
-            st.error(
-                f"❌ **Couldn't read cookies**: {e}\n\n"
-                f"**Try this:**\n"
-                f"1. Make sure your cookies file is valid\n"
-                f"2. Visit {PANEL_LOGIN_URL} and log in\n"
-                f"3. Upload your cookies.sqlite file"
+    def open_or_navigate(self, url, session_dir):
+        """Launches browser if not running, or navigates if already open."""
+        if self.pw is None or self.context is None or self.page is None or self.page.is_closed():
+            self.close()
+            self.pw = sync_playwright().start()
+            self.context = self.pw.chromium.launch_persistent_context(
+                user_data_dir=session_dir,
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
             )
-            st.stop()
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
 
-        matched_cookies = cookies_for_domain(session, domain)
+        self.page.goto(url)
+        return self.page.url
 
+    def current_url(self):
+        if self.page is not None and not self.page.is_closed():
+            return self.page.url
+        return None
+
+    def extract(self, timeout_s):
+        if self.page is None or self.page.is_closed():
+            raise RuntimeError("No open browser page.")
+
+        deadline = time.time() + timeout_s
+        media_urls = []
+        while time.time() < deadline:
+            full_html = self.page.content()
+
+            cdn_pattern = r'https?://[a-zA-Z0-9.-]*imagecdn\.99acres\.com/[^\s"\'<>`\)\(\]\[]+'
+            ext_pattern = r'https?://[^\s"\'<>`\)\(\]\[]+\.(?:pdf|mp4|jpg|jpeg|png|docx)[^\s"\'<>`\)\(\]\[]*'
+
+            raw_matches = re.findall(cdn_pattern, full_html, re.IGNORECASE) + \
+                          re.findall(ext_pattern, full_html, re.IGNORECASE)
+
+            clean_urls = set()
+            for url in raw_matches:
+                clean_url = re.sub(r'["\'<>`\)\(\]\[;].*$', '', url)
+                if "imagecdn.99acres.com" in clean_url or any(
+                    clean_url.lower().endswith(e) for e in ('.pdf', '.mp4', '.jpg', '.png', '.docx')
+                ):
+                    clean_urls.add(clean_url)
+
+            if clean_urls:
+                media_urls = list(clean_urls)
+                break
+            time.sleep(2)
+
+        return media_urls, self.page.url
+
+    def close(self):
         try:
-            resp = session.get(panel_url, timeout=30, allow_redirects=True)
-            html = resp.text
-        except Exception as e:
-            st.error(f"❌ Couldn't fetch the panel page: {e}")
-            st.stop()
+            if self.context:
+                self.context.close()
+        except Exception:
+            pass
+        try:
+            if self.pw:
+                self.pw.stop()
+        except Exception:
+            pass
+        self.pw = None
+        self.context = None
+        self.page = None
 
-    with st.expander("🔧 Diagnostics (if you get an error)"):
-        st.write(f"**Cookies found for `{domain}`:** {len(matched_cookies)}")
-        if matched_cookies:
-            st.caption(", ".join(c.name for c in matched_cookies))
-        st.write(f"**HTTP status:** {resp.status_code}")
-        st.write(f"**Final URL:** `{resp.url}`")
-        st.write(f"**Response length:** {len(html)} characters")
-        st.code(html[:1500])
 
-    if not matched_cookies:
-        st.error(
-            f"❌ **No login cookies found for {domain}**\n\n"
-            f"**Fix:** Make sure your cookies.sqlite file contains 99acres.com login cookies"
-        )
-        st.stop()
+def get_batch_subfolder(url):
+    """Extracts batchId from URL to create a unique subfolder."""
+    parsed = urllib.parse.urlparse(url)
+    query_params = urllib.parse.parse_qs(parsed.query)
 
-    if looks_logged_out(html, resp.status_code, resp.url):
-        st.info("🤖 **Page appears to be dynamically rendered with JavaScript. Attempting to load with Selenium...**")
+    if "batchId" in query_params and query_params["batchId"]:
+        batch_id = query_params["batchId"][0]
+        safe_batch_id = re.sub(r'[^a-zA-Z0-9_-]', '_', batch_id)
+        return f"batch_{safe_batch_id}"
 
-        # Determine preferred browser based on what we're using for cookies
-        prefer_browser = "firefox" if browser_name == "Firefox" else "chrome"
-        html, selenium_error = fetch_with_selenium(session, panel_url, prefer_browser=prefer_browser)
+    return f"batch_download_{int(time.time())}"
 
-        if html is None:
-            gecko_path = find_geckodriver()
-            chrome_path = find_chromedriver()
 
-            st.warning(
-                f"⚠️ **Page uses JavaScript to render content**\n\n"
-                f"Selenium error: {selenium_error}\n\n"
-                f"**WebDriver Status:**\n"
-                f"- GeckoDriver (Firefox): {'✅ Found at ' + gecko_path if gecko_path else '❌ Not found'}\n"
-                f"- ChromeDriver (Chrome): {'✅ Found at ' + chrome_path if chrome_path else '❌ Not found'}\n\n"
-                f"**To fix:**\n"
-                f"1. Download and extract a WebDriver:\n"
-                f"   - **GeckoDriver**: https://github.com/mozilla/geckodriver/releases\n"
-                f"   - **ChromeDriver**: https://chromedriver.chromium.org/\n"
-                f"2. Place it in your project folder or add to system PATH\n"
-                f"3. Restart Streamlit and try again"
-            )
-            st.stop()
+# --- Persistent single-thread executor + manager ---
+if "browser_executor" not in st.session_state:
+    st.session_state.browser_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+if "browser_manager" not in st.session_state:
+    st.session_state.browser_manager = BrowserManager()
+
+executor = st.session_state.browser_executor
+manager = st.session_state.browser_manager
+
+
+def run(fn, *args, **kwargs):
+    return executor.submit(fn, *args, **kwargs).result()
+
+
+col1, col2 = st.columns(2)
+with col1:
+    retry_clicked = st.button("🔄 Retry Extraction / Download")
+with col2:
+    reset_clicked = st.button("🔁 Reset Browser")
+
+status_box = st.empty()
+url_box = st.empty()
+
+# Function to run the full navigation + extraction process
+def process_and_download(target_url):
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    try:
+        status_box.info("🌐 Opening/Navigating browser window...")
+        current_url = run(manager.open_or_navigate, target_url, SESSION_DIR)
+        url_box.caption(f"Current browser URL: {current_url}")
+
+        status_box.info("⏳ Scanning the page for attachment links...")
+        media_urls, final_url = run(manager.extract, content_wait_seconds)
+
+        if media_urls:
+            status_box.success(f"Found {len(media_urls)} attachment link(s)!")
+            
+            subfolder_name = get_batch_subfolder(final_url)
+            target_download_dir = os.path.join(output_folder, subfolder_name)
+            os.makedirs(target_download_dir, exist_ok=True)
+
+            st.success(f"Downloading files to `{os.path.abspath(target_download_dir)}`...")
+            progress_bar = st.progress(0)
+            download_container = st.container()
+
+            for idx, file_url in enumerate(media_urls):
+                try:
+                    clean_url = file_url.split('?')[0]
+                    file_name = os.path.basename(urllib.parse.urlparse(clean_url).path)
+                    if not file_name or '.' not in file_name:
+                        file_name = f"attachment_{idx+1}.pdf"
+
+                    file_path = os.path.join(target_download_dir, file_name)
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                    res = requests.get(file_url, headers=headers, stream=True, timeout=30)
+
+                    if res.status_code == 200:
+                        with open(file_path, "wb") as f:
+                            for chunk in res.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        download_container.write(f"✅ Downloaded: **{file_name}**")
+                    else:
+                        download_container.write(f"❌ Failed: **{file_name}** (HTTP {res.status_code})")
+                except Exception as err:
+                    download_container.write(f"⚠️ Error downloading {file_url}: {err}")
+
+                progress_bar.progress((idx + 1) / len(media_urls))
+
+            st.balloons()
         else:
-            st.success("✅ Page loaded with Selenium successfully!")
+            status_box.warning(
+                "No attachment links found within the time limit. If login is required, "
+                "please log in inside the popup browser window and click '🔄 Retry Extraction'."
+            )
+    except Exception as e:
+        st.error(f"Error: {e}")
 
-    attachments = extract_attachments(html, panel_url)
 
-    with st.expander("🔍 Debug: Raw HTML (first 3000 chars)"):
-        st.code(html[:3000])
+# --- Reset Handler ---
+if reset_clicked:
+    try:
+        run(manager.close)
+    except Exception as e:
+        st.warning(f"Cleanup warning: {e}")
+    st.session_state.last_processed_url = ""
+    status_box.info("Browser closed.")
 
-    if not attachments:
-        st.warning(
-            "❌ **No attachments detected on this page**\n\n"
-            "Check the Debug section above and look for file URLs you expect to see."
-        )
-        st.stop()
+# --- Auto-Trigger Logic on Link Input ---
+clean_panel_url = panel_url.strip()
+if clean_panel_url and clean_panel_url != st.session_state.last_processed_url:
+    st.session_state.last_processed_url = clean_panel_url
+    process_and_download(clean_panel_url)
 
-    st.success(f"✅ Found {len(attachments)} attachment(s). Downloading...")
+# --- Manual Retry Handler ---
+elif retry_clicked and clean_panel_url:
+    process_and_download(clean_panel_url)
 
-    batch_id = batch_id_from_url(panel_url)
-    dest_folder = Path(dest_root) / sanitize_filename(batch_id)
-
-    start = time.time()
-    results = download_all(session, attachments, dest_folder)
-    elapsed = time.time() - start
-
-    ok = [r for r in results if r[1] is not None]
-    failed = [r for r in results if r[1] is None]
-
-    st.success(f"✅ Downloaded **{len(ok)}/{len(results)}** file(s) in **{elapsed:.1f}s**")
-    st.code(str(dest_folder), language="plaintext")
-
-    if failed:
-        st.warning(f"⚠️ {len(failed)} file(s) failed:")
-        for url, _, err in failed:
-            st.caption(f"- {url}\n  - {err}")
-
-    # Auto-open folder
-    st.info("📂 Opening folder...")
-    open_folder(dest_folder)
-    st.success("✅ Folder opened! Check your file explorer.")
+# Display current browser URL if browser is active
+if not reset_clicked:
+    try:
+        current_url = run(manager.current_url)
+        if current_url:
+            url_box.caption(f"Current browser URL: {current_url}")
+    except Exception:
+        pass
